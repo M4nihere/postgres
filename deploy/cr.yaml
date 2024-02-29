@@ -121,7 +121,7 @@ spec:
 #
     dataVolumeClaimSpec:
       accessModes:
-      - ReadWritemany
+      - ReadWriteOnce
       resources:
         requests:
           storage: 1Gi
