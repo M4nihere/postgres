@@ -118,14 +118,10 @@ spec:
 #       resources:
 #         requests:
 #           storage: 1Gi
-    volumeMounts:
-    - name: data-volume
-      mountPath: /opt/cafebot
-      claimRef:
-        name: cafebot-pvc
+#
     dataVolumeClaimSpec:
       accessModes:
-      - ReadWriteMany
+      - ReadWriteOnce
       resources:
         requests:
           storage: 1Gi
