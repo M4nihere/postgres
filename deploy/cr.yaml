@@ -119,12 +119,17 @@ spec:
 #         requests:
 #           storage: 1Gi
 #
-    #dataVolumeClaimSpec:
-    #  accessModes:
-    #  - ReadWriteOnce
-    #  resources:
-    #    requests:
-    #      storage: 1Gi
+    dataVolumeClaimSpec:
+      accessModes:
+      - ReadWritemany
+      resources:
+        requests:
+          storage: 1Gi
+      dataSource:
+        name: cafebot-pvc
+        kind: PersistentVolumeClaim
+        #apiGroup: ""
+        subPath: data/postgres
 
   proxy:
     pgBouncer:
