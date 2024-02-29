@@ -1,0 +1,13 @@
+custom-extensions
+demand-backup
+init-deploy
+migration-backup-s3
+monitoring
+operator-self-healing
+scaling
+scheduled-backup
+self-healing
+start-from-backup
+telemetry-transfer
+upgrade-minor
+users

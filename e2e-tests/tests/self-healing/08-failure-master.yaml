@@ -1,0 +1,18 @@
+apiVersion: kuttl.dev/v1beta1
+kind: TestStep
+timeout: 30
+commands:
+  - script: |-
+      set -o errexit
+      set -o xtrace
+
+      source ../../functions
+
+      init_pod=$(get_pod_by_role self-healing master name)
+      failure_pod "${NAMESPACE}" "$(get_pod_by_role self-healing master name)"
+      sleep 30 # wait a bit for pod to be killed and new master elected
+
+      if [ "$init_pod" == "$(get_pod_by_role self-healing master name)" ]; then
+        echo "master pod was not killed! something went wrong."
+        exit 1
+      fi

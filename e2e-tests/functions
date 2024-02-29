@@ -1,0 +1,701 @@
+#!/bin/bash
+
+# set root repo relatively to a test dir
+ROOT_REPO=${ROOT_REPO:-$(realpath ../../..)}
+test_name=$(basename "$(pwd)")
+source "${ROOT_REPO}/e2e-tests/vars.sh"
+
+if oc get projects 2>/dev/null; then
+	OPENSHIFT=4
+fi
+
+init_temp_dir() {
+	rm -rf "$TEMP_DIR"
+	mkdir -p "$TEMP_DIR"
+}
+
+create_namespace() {
+	local namespace=$1
+
+	if [[ $OPENSHIFT ]]; then
+		set -o pipefail
+		if [[ $OPERATOR_NS ]] && (oc get project "$OPERATOR_NS" -o json >/dev/null 2>&1 | jq -r '.metadata.name' >/dev/null 2>&1); then
+			oc delete --grace-period=0 --force=true project "$namespace" && sleep 120 || :
+		else
+			oc delete project "$namespace" && sleep 40 || :
+		fi
+		wait_for_delete "project/$namespace"
+
+		oc new-project "$namespace"
+		oc project "$namespace"
+		oc adm policy add-scc-to-user hostaccess -z default || :
+	else
+		kubectl delete namespace $namespace --ignore-not-found || :
+		kubectl wait --for=delete namespace "$namespace" || :
+		kubectl create namespace $namespace
+	fi
+}
+
+deploy_operator() {
+	local cw_prefix=""
+
+	destroy_operator
+
+	if [[ $OPERATOR_NS ]]; then
+		create_namespace $OPERATOR_NS
+		cw_prefix="cw-"
+	fi
+	kubectl -n "${OPERATOR_NS:-$NAMESPACE}" apply --server-side --force-conflicts -f "${DEPLOY_DIR}/crd.yaml"
+	kubectl -n "${OPERATOR_NS:-$NAMESPACE}" apply --server-side --force-conflicts -f "${DEPLOY_DIR}/${cw_prefix}rbac.yaml"
+
+	local disable_telemetry=true
+	if [ "${test_name}" == "telemetry-transfer" ]; then
+		disable_telemetry=false
+	fi
+	yq eval '.spec.template.spec.containers[0].image = "'${IMAGE}'"' "${DEPLOY_DIR}/${cw_prefix}operator.yaml" \
+		| yq eval '(.spec.template.spec.containers[] | select(.name=="operator") | .env[] | select(.name=="DISABLE_TELEMETRY") | .value) = "'${disable_telemetry}'"' - \
+		| kubectl -n "${OPERATOR_NS:-$NAMESPACE}" apply -f -
+}
+
+deploy_operator_gh() {
+	local git_tag="$1"
+	local cw_prefix=""
+
+	destroy_operator
+
+	if [[ $OPERATOR_NS ]]; then
+		create_namespace $OPERATOR_NS
+		cw_prefix="cw-"
+	fi
+	kubectl -n "${OPERATOR_NS:-$NAMESPACE}" apply --server-side --force-conflicts -f "https://raw.githubusercontent.com/percona/percona-postgresql-operator/${git_tag}/deploy/crd.yaml"
+	kubectl -n "${OPERATOR_NS:-$NAMESPACE}" apply --server-side --force-conflicts -f "https://raw.githubusercontent.com/percona/percona-postgresql-operator/${git_tag}/deploy/${cw_prefix}rbac.yaml"
+
+	curl -s "https://raw.githubusercontent.com/percona/percona-postgresql-operator/${git_tag}/deploy/${cw_prefix}operator.yaml" >"${TEMP_DIR}/${cw_prefix}operator_${git_tag}.yaml"
+
+	yq eval '.spec.template.spec.containers[0].image = "percona/percona-postgresql-operator:'${git_tag#v}'"' \
+		"${TEMP_DIR}/${cw_prefix}operator_${git_tag}.yaml" \
+		| kubectl -n "${OPERATOR_NS:-$NAMESPACE}" apply -f -
+}
+
+destroy_operator() {
+	kubectl -n "${OPERATOR_NS:-$NAMESPACE}" delete deployment percona-postgresql-operator --force --grace-period=0 || true
+	if [[ $OPERATOR_NS ]]; then
+		kubectl delete namespace $OPERATOR_NS --force --grace-period=0 || true
+	fi
+}
+
+get_operator_pod() {
+	echo $(kubectl get pods -n "${OPERATOR_NS:-$NAMESPACE}" --selector=app.kubernetes.io/name=percona-postgresql-operator -o jsonpath='{.items[].metadata.name}')
+}
+
+deploy_s3_secrets() {
+	set +o xtrace
+	printf "[global]\nrepo1-s3-key=%s\nrepo1-s3-key-secret=%s\n" \
+		"$(yq eval 'select(.metadata.name=="*s3*").data.AWS_ACCESS_KEY_ID' "${TESTS_CONFIG_DIR}/cloud-secret.yml" | base64 -d)" \
+		"$(yq eval 'select(.metadata.name=="*s3*").data.AWS_SECRET_ACCESS_KEY' "${TESTS_CONFIG_DIR}/cloud-secret.yml" | base64 -d)" \
+		>"${TEMP_DIR}/pgbackrest-secret.ini"
+
+	case ${test_name} in
+		scheduled-backup)
+			printf 'repo2-gcs-key=/etc/pgbackrest/conf.d/gcs-key.json\n' >>"${TEMP_DIR}/pgbackrest-secret.ini"
+			yq eval '.stringData["credentials.json"]' ${TESTS_CONFIG_DIR}/cloud-secret-minio-gw.yml >${TEMP_DIR}/gcs-key.json
+			kubectl -n "${NAMESPACE}" create secret generic "${test_name}-pgbackrest-secrets" --from-file=cloud.conf="${TEMP_DIR}/pgbackrest-secret.ini" --from-file=gcs-key.json=${TEMP_DIR}/gcs-key.json
+			;;
+		custom-extensions)
+			kubectl -n "${NAMESPACE}" apply -f "${TESTS_CONFIG_DIR}/cloud-secret.yml"
+			;;
+		*)
+			kubectl -n "${NAMESPACE}" create secret generic "${test_name}-pgbackrest-secrets" --from-file=cloud.conf="${TEMP_DIR}/pgbackrest-secret.ini"
+			;;
+	esac
+
+	set -o xtrace
+}
+
+deploy_client() {
+	kubectl -n "${NAMESPACE}" apply -f "${TESTS_CONFIG_DIR}/client.yaml"
+}
+
+get_client_pod() {
+	kubectl -n ${NAMESPACE} get pods --selector=name=pg-client -o 'jsonpath={.items[].metadata.name}'
+}
+
+get_cr() {
+	local name_suffix=$1
+
+	yq eval '
+		.metadata.name = "'$test_name'" |
+		.metadata.labels = {"e2e":"'$test_name'"} |
+		.spec.postgresVersion = '$PG_VER' |
+		.spec.users += [{"name":"postgres","password":{"type":"AlphaNumeric"}}] |
+		.spec.users += [{"name":"'$test_name'","password":{"type":"AlphaNumeric"}}] |
+		.spec.image = "'$IMAGE_POSTGRESQL'" |
+		.spec.backups.pgbackrest.image = "'$IMAGE_BACKREST'" |
+		.spec.proxy.pgBouncer.image = "'$IMAGE_PGBOUNCER'" |
+		.spec.pmm.image = "'$IMAGE_PMM_CLIENT'" |
+		.spec.pmm.secret = "'$test_name'-pmm-secret"
+		' $DEPLOY_DIR/cr.yaml >$TEMP_DIR/cr.yaml
+
+	if [[ $OPENSHIFT ]]; then
+		yq eval -i '.spec.openshift = true' $TEMP_DIR/cr.yaml
+	fi
+
+	case $test_name in
+		"demand-backup" | "start-from-backup")
+			yq eval -i '
+				.spec.backups.pgbackrest.configuration = [{"secret":{"name":"'$test_name'-pgbackrest-secrets"}}] |
+				.spec.backups.pgbackrest.manual.repoName = "repo1" |
+				.spec.backups.pgbackrest.manual.options = ["--type=full"] |
+				.spec.backups.pgbackrest.global.repo1-path = "/backrestrepo/postgres-operator/'$test_name${name_suffix:+-$name_suffix}'/repo1" |
+				.spec.backups.pgbackrest.repos = [{"name":"repo1","s3":{"bucket":"'$BUCKET'","endpoint":"s3.amazonaws.com","region":"us-east-1"}}]
+				' $TEMP_DIR/cr.yaml
+
+			if [[ $test_name == "start-from-backup" ]]; then
+				yq eval -i '
+					.spec.dataSource.pgbackrest.configuration = [{"secret":{"name":"'$test_name'-pgbackrest-secrets"}}] |
+					.spec.dataSource.pgbackrest.stanza = "db" |
+					.spec.dataSource.pgbackrest.global.repo1-path = "/cluster-source/demand-backup-ppg'$PG_VER'/repo1" |
+					.spec.dataSource.pgbackrest.repo = {"name":"repo1","s3":{"bucket":"'$BUCKET'","endpoint":"s3.amazonaws.com","region":"us-east-1"}}
+					' $TEMP_DIR/cr.yaml
+			fi
+			;;
+		"scheduled-backup")
+			yq eval -i '
+				.spec.backups.pgbackrest.configuration = [{"secret":{"name":"'$test_name'-pgbackrest-secrets"}}] |
+				.spec.backups.pgbackrest.manual.repoName = "repo1" |
+				.spec.backups.pgbackrest.manual.options = ["--type=full"] |
+				.spec.backups.pgbackrest.global.repo1-path = "/backrestrepo/postgres-operator/'$test_name${name_suffix:+-$name_suffix}'/repo1" |
+				.spec.backups.pgbackrest.global.repo2-path = "/backrestrepo/postgres-operator/'$test_name${name_suffix:+-$name_suffix}'/repo2" |
+				.spec.backups.pgbackrest.repos = [{"name":"repo1","s3":{"bucket":"'$BUCKET'","endpoint":"s3.amazonaws.com","region":"us-east-1"}}] |
+				.spec.backups.pgbackrest.repos += [{"name":"repo2","gcs":{"bucket":"'$BUCKET'"}}]
+				' $TEMP_DIR/cr.yaml
+			;;
+		"custom-extensions")
+			yq eval -i '
+				.spec.extensions.image = "'$IMAGE'" |
+				.spec.extensions.imagePullPolicy = "Always" |
+				.spec.extensions.storage = {"type": "s3", "bucket": "pg-extensions", "region": "eu-central-1", "secret": {"name": "aws-s3-secret"}}
+			    ' $TEMP_DIR/cr.yaml
+			;;
+	esac
+	cat $TEMP_DIR/cr.yaml
+}
+
+run_psql_local() {
+	local command=${1}
+	local uri=${2}
+	local driver=${3:-postgres}
+
+	kubectl -n ${NAMESPACE} exec $(get_client_pod) -- \
+		bash -c "printf '$command\n' | psql -v ON_ERROR_STOP=1 -t -q $driver://'$uri'"
+}
+
+run_psql() {
+	local command=${1}
+	local uri=${2}
+	local password=${3}
+
+	kubectl -n ${NAMESPACE} exec $(get_client_pod) -- \
+		bash -c "printf '$command\n' | PGPASSWORD="\'$password\'" psql -v ON_ERROR_STOP=1 -t -q $uri"
+}
+
+get_psql_user_pass() {
+	local secret_name=${1}
+
+	kubectl -n ${NAMESPACE} get "secret/${secret_name}" --template='{{.data.password | base64decode}}'
+}
+
+get_pgbouncer_host() {
+	local secret_name=${1}
+
+	kubectl -n ${NAMESPACE} get "secret/${secret_name}" -o jsonpath={.data.pgbouncer-host} | base64 -d
+}
+
+get_psql_user_host() {
+	local secret_name=${1}
+
+	kubectl -n ${NAMESPACE} get "secret/${secret_name}" --template='{{.data.host | base64decode }}'
+}
+
+get_instance_set_pods() {
+	local instance=${1:-instance1}
+
+	kubectl get pods -n ${NAMESPACE} --selector postgres-operator.crunchydata.com/instance-set=${instance} -o custom-columns='NAME:.metadata.name' --no-headers
+}
+
+get_psql_pod_host() {
+	local pod=${1}
+
+	echo "${pod}.${test_name}-pods.${NAMESPACE}.svc"
+}
+
+wait_pod() {
+	local pod=$1
+
+	set +o xtrace
+	retry=0
+	echo -n $pod
+	until kubectl get pod/$pod -n "${NAMESPACE}" -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null | grep 'true'; do
+		sleep 1
+		echo -n .
+		let retry+=1
+		if [ $retry -ge 360 ]; then
+			kubectl describe pod/$pod -n "${NAMESPACE}"
+			kubectl logs $pod -n "${NAMESPACE}"
+			kubectl logs $(get_operator_pod) ${OPERATOR_NS:+-n $OPERATOR_NS} \
+				| grep -v 'level=info' \
+				| grep -v 'level=debug' \
+				| grep -v 'Getting tasks for pod' \
+				| grep -v 'Getting pods from source' \
+				| tail -100
+			echo max retry count $retry reached. something went wrong with operator or kubernetes cluster
+			exit 1
+		fi
+	done
+	set -o xtrace
+}
+
+get_service_ip() {
+	local service=$1
+	while (kubectl get service/$service -n "${NAMESPACE}" -o 'jsonpath={.spec.type}' 2>&1 || :) | grep -q NotFound; do
+		sleep 1
+	done
+	if [ "$(kubectl get service/$service -n "${NAMESPACE}" -o 'jsonpath={.spec.type}')" = "ClusterIP" ]; then
+		kubectl get service/$service -n "${NAMESPACE}" -o 'jsonpath={.spec.clusterIP}'
+		return
+	fi
+	until kubectl get service/$service -n "${NAMESPACE}" -o 'jsonpath={.status.loadBalancer.ingress[]}' 2>&1 | egrep -q "hostname|ip"; do
+		sleep 1
+	done
+	kubectl get service/$service -n "${NAMESPACE}" -o 'jsonpath={.status.loadBalancer.ingress[].ip}'
+	kubectl get service/$service -n "${NAMESPACE}" -o 'jsonpath={.status.loadBalancer.ingress[].hostname}'
+}
+
+wait_for_delete() {
+	local res="$1"
+
+	echo -n "$res - "
+	retry=0
+	until (kubectl get $res -n "${NAMESPACE}" || :) 2>&1 | grep NotFound; do
+		sleep 1
+		echo -n .
+		let retry+=1
+		if [ $retry -ge 120 ]; then
+			echo max retry count $retry reached. something went wrong with operator or kubernetes cluster
+			exit 1
+		fi
+	done
+}
+
+deploy_pmm_server() {
+	helm uninstall -n "${NAMESPACE}" pmm || :
+	if [[ $OPENSHIFT ]]; then
+		platform=openshift
+		oc create sa pmm-server -n "$NAMESPACE"
+		oc adm policy add-scc-to-user privileged -z pmm-server -n "$NAMESPACE"
+
+		if [[ $OPERATOR_NS ]]; then
+			timeout 30 oc delete clusterrolebinding $(kubectl get clusterrolebinding | grep 'pmm-pg-operator-' | awk '{print $1}') || :
+			oc create clusterrolebinding pmm-pg-operator-cluster-wide --clusterrole=percona-postgresql-operator --serviceaccount=$NAMESPACE:pmm-server -n "$NAMESPACE"
+			oc patch clusterrole/percona-postgresql-operator --type json -p='[{"op":"add","path": "/rules/-","value":{"apiGroups":["security.openshift.io"],"resources":["securitycontextconstraints"],"verbs":["use"],"resourceNames":["privileged"]}}]' ${OPERATOR_NS:+-n $OPERATOR_NS}
+		else
+			oc create rolebinding pmm-pg-operator-namespace-only --role percona-postgresql-operator --serviceaccount=$NAMESPACE:pmm-server -n "${NAMESPACE}"
+			oc patch role/percona-postgresql-operator --type json -p='[{"op":"add","path": "/rules/-","value":{"apiGroups":["security.openshift.io"],"resources":["securitycontextconstraints"],"verbs":["use"],"resourceNames":["privileged"]}}]' -n "$NAMESPACE"
+		fi
+		helm install monitoring --set imageTag=${IMAGE_PMM_SERVER#*:} --set imageRepo=${IMAGE_PMM_SERVER%:*} --set platform=$platform --set sa=pmm-server --set supresshttp2=false https://percona-charts.storage.googleapis.com/pmm-server-${PMM_SERVER_VERSION}.tgz -n "$NAMESPACE"
+	else
+		platform=kubernetes
+		helm install monitoring -n "$NAMESPACE" --set imageTag=${IMAGE_PMM_SERVER#*:} --set service.type="LoadBalancer" \
+			--set imageRepo=${IMAGE_PMM_SERVER%:*} --set platform="$platform" "https://percona-charts.storage.googleapis.com/pmm-server-${PMM_SERVER_VERSION}.tgz"
+	fi
+}
+
+generate_pmm_api_key() {
+	local ADMIN_PASSWORD=$(kubectl -n "${NAMESPACE}" exec monitoring-0 -- bash -c "printenv | grep ADMIN_PASSWORD | cut -d '=' -f2")
+	local PMM_SERVICE_IP=$(get_service_ip monitoring-service)
+	curl \
+		--insecure \
+		-X POST \
+		-H "Content-Type: application/json" \
+		-d '{"name":"'${RANDOM}'", "role": "Admin"}' \
+		--user "admin:${ADMIN_PASSWORD}" \
+		"https://${PMM_SERVICE_IP}/graph/api/auth/keys" \
+		| jq -r .key
+}
+
+get_metric_values() {
+	local metric=$1
+	local instance=$2
+	local api_key=$3
+	local start=$($date -u "+%s" -d "-1 minute")
+	local end=$($date -u "+%s")
+	local endpoint=$(get_service_ip monitoring-service)
+
+	curl -s -k -H "Authorization: Bearer ${api_key}" "https://$endpoint/graph/api/datasources/proxy/1/api/v1/query_range?query=min%28$metric%7Bnode_name%3D%7E%22$instance%22%7d%20or%20$metric%7Bnode_name%3D%7E%22$instance%22%7D%29&start=$start&end=$end&step=60" \
+		| jq '.data.result[0].values[][1]' \
+		| grep '^"[0-9]'
+}
+
+get_qan20_values() {
+	local instance=$1
+	local api_key=$2
+	local start=$($date -u "+%Y-%m-%dT%H:%M:%S" -d "-30 minute")
+	local end=$($date -u "+%Y-%m-%dT%H:%M:%S")
+	local endpoint=$(get_service_ip monitoring-service)
+
+	cat >payload.json <<EOF
+{
+   "columns":[
+	  "load",
+	  "num_queries",
+	  "query_time"
+   ],
+   "first_seen": false,
+   "group_by": "queryid",
+   "include_only_fields": [],
+   "keyword": "",
+   "labels": [
+	   {
+		   "key": "cluster",
+		   "value": ["postgresql"]
+   }],
+   "limit": 10,
+   "offset": 0,
+   "order_by": "-load",
+   "main_metric": "load",
+   "period_start_from": "$($date -u -d '-12 hour' '+%Y-%m-%dT%H:%M:%S%:z')",
+   "period_start_to": "$($date -u '+%Y-%m-%dT%H:%M:%S%:z')"
+}
+EOF
+
+	curl -s -k -H "Authorization: Bearer ${api_key}" -XPOST -d @payload.json "https://$endpoint/v0/qan/GetReport" \
+		| jq '.rows[].sparkline'
+	rm -f payload.json
+}
+
+deploy_chaos_mesh() {
+	destroy_chaos_mesh
+
+	helm repo add chaos-mesh https://charts.chaos-mesh.org
+	helm install chaos-mesh chaos-mesh/chaos-mesh --namespace=${NAMESPACE} --set chaosDaemon.runtime=containerd --set chaosDaemon.socketPath=/run/containerd/containerd.sock --set dashboard.create=false --version 2.5.1
+	if [[ $OPENSHIFT ]]; then
+		oc adm policy add-scc-to-user privileged -z chaos-daemon --namespace=${NAMESPACE}
+	fi
+	sleep 10
+}
+
+destroy_chaos_mesh() {
+	local chaos_mesh_ns=$(helm list --all-namespaces --filter chaos-mesh | tail -n1 | awk -F' ' '{print $2}' | sed 's/NAMESPACE//')
+
+	if [ -n "${chaos_mesh_ns}" ]; then
+		helm uninstall --wait --timeout 60s chaos-mesh --namespace ${chaos_mesh_ns} || :
+	fi
+	timeout 30 kubectl delete MutatingWebhookConfiguration $(kubectl get MutatingWebhookConfiguration | grep 'chaos-mesh' | awk '{print $1}') || :
+	timeout 30 kubectl delete ValidatingWebhookConfiguration $(kubectl get ValidatingWebhookConfiguration | grep 'chaos-mesh' | awk '{print $1}') || :
+	timeout 30 kubectl delete ValidatingWebhookConfiguration $(kubectl get ValidatingWebhookConfiguration | grep 'validate-auth' | awk '{print $1}') || :
+	for i in $(kubectl api-resources | grep chaos-mesh | awk '{print $1}'); do
+		kubectl get ${i} --all-namespaces --no-headers -o custom-columns=Kind:.kind,Name:.metadata.name,NAMESPACE:.metadata.namespace \
+			| while read -r line; do
+				local kind=$(echo "$line" | awk '{print $1}')
+				local name=$(echo "$line" | awk '{print $2}')
+				local namespace=$(echo "$line" | awk '{print $3}')
+				kubectl patch $kind $name -n $namespace --type=merge -p '{"metadata":{"finalizers":[]}}' || :
+			done
+		timeout 30 kubectl delete ${i} --all --all-namespaces || :
+	done
+	timeout 30 kubectl delete crd $(kubectl get crd | grep 'chaos-mesh.org' | awk '{print $1}') || :
+	timeout 30 kubectl delete clusterrolebinding $(kubectl get clusterrolebinding | grep 'chaos-mesh' | awk '{print $1}') || :
+	timeout 30 kubectl delete clusterrole $(kubectl get clusterrole | grep 'chaos-mesh' | awk '{print $1}') || :
+}
+
+kill_pods() {
+	local ns=$1
+	local selector=$2
+	local pod_label=$3
+	local label_value=$4
+
+	if [ "${selector}" == "pod" ]; then
+		yq eval '
+			.metadata.name = "chaos-pod-kill-'${RANDOM}'" |
+			del(.spec.selector.pods.test-namespace) |
+			.spec.selector.pods.'${ns}'[0] = "'${pod_label}'"' ${TESTS_CONFIG_DIR}/chaos-pod-kill.yml \
+			| kubectl apply --namespace ${ns} -f -
+	elif [ "${selector}" == "label" ]; then
+		yq eval '
+			.metadata.name = "chaos-kill-label-'${RANDOM}'" |
+			.spec.mode = "all" |
+			del(.spec.selector.pods) |
+			.spec.selector.labelSelectors."'${pod_label}'" = "'${label_value}'"' ${TESTS_CONFIG_DIR}/chaos-pod-kill.yml \
+			| kubectl apply --namespace ${ns} -f -
+	fi
+	sleep 5
+}
+
+failure_pod() {
+	local ns=$1
+	local pod=$2
+
+	yq eval '
+        .metadata.name = "chaos-pod-failure-'${RANDOM}'" |
+        del(.spec.selector.pods.test-namespace) |
+        .spec.selector.pods.'${ns}'[0] = "'${pod}'"' ${TESTS_CONFIG_DIR}/chaos-pod-failure.yml \
+		| kubectl apply --namespace ${ns} -f -
+	sleep 5
+}
+
+network_loss() {
+	local ns=$1
+	local pod=$2
+
+	yq eval '
+        .metadata.name = "chaos-pod-network-loss-'${RANDOM}'" |
+        del(.spec.selector.pods.test-namespace) |
+        .spec.selector.pods.'${ns}'[0] = "'${pod}'"' ${TESTS_CONFIG_DIR}/chaos-network-loss.yml \
+		| kubectl apply --namespace ${ns} -f -
+	sleep 5
+}
+
+wait_deployment() {
+	local name=$1
+	local target_namespace=${2:-"$namespace"}
+
+	sleep 10
+	set +o xtrace
+	retry=0
+	echo -n $name
+	until [ -n "$(kubectl -n ${target_namespace} get deployment $name -o jsonpath='{.status.replicas}')" \
+		-a "$(kubectl -n ${target_namespace} get deployment $name -o jsonpath='{.status.replicas}')" \
+		== "$(kubectl -n ${target_namespace} get deployment $name -o jsonpath='{.status.readyReplicas}')" ]; do
+		sleep 1
+		echo -n .
+		let retry+=1
+		if [ $retry -ge 360 ]; then
+			kubectl logs $(get_operator_pod) -c operator \
+				| grep -v 'level=info' \
+				| grep -v 'level=debug' \
+				| tail -100
+			echo max retry count $retry reached. something went wrong with operator or kubernetes cluster
+			exit 1
+		fi
+	done
+	echo
+	set -o xtrace
+}
+
+get_pod_by_role() {
+	local cluster=${1}
+	local role=${2}
+	local parameter=${3}
+
+	case ${parameter} in
+		'name')
+			local jsonpath="{.items[].metadata.name}"
+			;;
+		'IP')
+			local jsonpath="{.items[].status.podIP}"
+			;;
+	esac
+
+	echo "$(kubectl get pods --namespace ${NAMESPACE} --selector=postgres-operator.crunchydata.com/role=${role},postgres-operator.crunchydata.com/cluster=${cluster} -o 'jsonpath='${jsonpath}'')"
+}
+
+check_passwords_leak() {
+	local secrets
+	local passwords
+	local pods
+
+	secrets=$(
+		kubectl -n "${NAMESPACE}" get secrets -o json | jq -r '.items[] | select(.data."password"? != null) | .data."password"'
+		kubectl -n "${NAMESPACE}" get secrets -o json | jq -r '.items[] | select(.data."pgbouncer-password"? != null) | .data."pgbouncer-password"'
+	)
+
+	passwords="$(for i in $secrets; do
+		base64 -d <<<$i
+		echo
+	done) $secrets"
+	pods=$(kubectl -n "${NAMESPACE}" get pods -o name | awk -F "/" '{print $2}')
+
+	collect_logs() {
+		local containers
+		local count
+
+		NS=$1
+		for p in $pods; do
+			containers=$(kubectl -n "$NS" get pod $p -o jsonpath='{.spec.containers[*].name}')
+			for c in $containers; do
+				# temporary, because of: https://jira.percona.com/browse/PMM-8357
+				if [[ $c =~ "pmm" ]]; then
+					continue
+				fi
+				kubectl -n "$NS" logs $p -c $c >${TEMP_DIR}/logs_output-$p-$c.txt
+				echo logs saved in: ${TEMP_DIR}/logs_output-$p-$c.txt
+				for pass in $passwords; do
+					count=$(grep -c --fixed-strings -- "$pass" ${TEMP_DIR}/logs_output-$p-$c.txt || :)
+					if [[ $count != 0 ]]; then
+						echo leaked passwords are found in log ${TEMP_DIR}/logs_output-$p-$c.txt
+						false
+					fi
+				done
+			done
+			echo
+		done
+	}
+
+	collect_logs $NAMESPACE
+	if [ -n "$OPERATOR_NS" ]; then
+		pods=$(kubectl -n "${OPERATOR_NS}" get pods -o name | awk -F "/" '{print $2}')
+		collect_logs $OPERATOR_NS
+	fi
+}
+
+get_backup_destination() {
+	local cluster=$1
+	local backup_name=$2
+
+	local repo
+	local storage_type
+
+	repo=$(kubectl get pg-backup -n "$NAMESPACE" "$backup_name" -o yaml \
+		| yq ".spec.repoName")
+
+	if [[ $(kubectl get pg -n "$NAMESPACE" "$cluster" -o yaml \
+		| yq ".spec.backups.pgbackrest.repos[] | select(.name==\"$repo\") | has(\"s3\")") == "true" ]]; then
+		storage_type="s3"
+	elif [[ $(kubectl get pg -n "$NAMESPACE" "$cluster" -o yaml \
+		| yq ".spec.backups.pgbackrest.repos[] | select(.name==\"$repo\") | has(\"gcs\")") == "true" ]]; then
+		storage_type="gcs"
+	elif [[ $(kubectl get pg -n "$NAMESPACE" "$cluster" -o yaml \
+		| yq ".spec.backups.pgbackrest.repos[] | select(.name==\"$repo\") | has(\"azure\")") == "true" ]]; then
+		storage_type="azure"
+	else
+		echo "ERROR: unknown storage type"
+		exit 1
+	fi
+
+	local repo_path
+	local bucket
+
+	repo_path=$(kubectl get pg -n "$NAMESPACE" "$cluster" -o yaml \
+		| yq ".spec.backups.pgbackrest.global.$repo-path")
+	bucket=$(kubectl get pg -n "$NAMESPACE" "$cluster" -o yaml \
+		| yq ".spec.backups.pgbackrest.repos[] | select(.name==\"$repo\").$storage_type.bucket")
+
+	if [[ $storage_type == "gcs" ]]; then
+		storage_type="gs"
+	fi
+
+	echo -n "$storage_type://$bucket$repo_path"
+}
+
+get_backup_name_by_job() {
+	local job_name=$1
+
+	pgbackup_per_job=$(kubectl get pg-backup -n "$NAMESPACE" -o yaml \
+		| yq "[.items[] | select(.status.jobName==\"$job_name\")]" \
+		| yq '. | length')
+	if [[ $pgbackup_per_job != 1 ]]; then
+		echo "ERROR: pgbackup_per_job != 1"
+		exit 1
+	fi
+
+	kubectl get pg-backup -n "$NAMESPACE" -o yaml \
+		| yq ".items[] | select(.status.jobName==\"$job_name\").metadata.name"
+}
+
+check_jobs_and_pgbackups() {
+	local cluster=$1
+
+	job_names=()
+	kubectl get job -n "$NAMESPACE" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | while IFS= read -r line; do
+		job_names+=("$line")
+	done
+
+	for ((i = 0; i < ${#job_names[@]}; i++)); do
+		job_name=${job_names[$i]}
+
+		backup_name=$(get_backup_name_by_job "$job_name")
+
+		dest=$(kubectl get pg-backup -n "$NAMESPACE" "$backup_name" -o yaml | yq ".status.destination")
+		if [[ $dest != "$(get_backup_destination "$cluster" "$backup_name")" ]]; then
+			echo "ERROR: $dest != $(get_backup_destination "$cluster" "$backup_name")"
+			exit 1
+		fi
+
+		job_backup_type=$(kubectl get job "$job_name" -n "$NAMESPACE" -o yaml \
+			| yq '.spec.template.metadata.labels."postgres-operator.crunchydata.com/pgbackrest-backup"')
+		if [[ $job_backup_type == "null" ]]; then
+			job_backup_type=$(kubectl get job "$job_name" -n "$NAMESPACE" -o yaml \
+				| yq '.spec.template.metadata.labels."postgres-operator.crunchydata.com/pgbackrest-cronjob"')
+		fi
+		if [[ $job_backup_type == "replica-create" ]]; then
+			job_backup_type="incremental"
+		fi
+		if [[ $job_backup_type == "manual" ]]; then
+			job_backup_type="full"
+		fi
+		pg_backup_type=$(kubectl get pg-backup -n "$NAMESPACE" "$backup_name" -o yaml \
+			| yq '.status.backupType')
+
+		if [[ $job_backup_type != "$pg_backup_type" ]]; then
+			echo "ERROR: backup type $job_backup_type != $pg_backup_type"
+			exit 1
+		fi
+	done
+}
+
+restart_pg_pods() {
+	local cluster=$1
+	local instance=$2
+
+	pods=$(kubectl get pods -n "${NAMESPACE}" --selector=postgres-operator.crunchydata.com/cluster="${cluster}",postgres-operator.crunchydata.com/instance-set="${instance}" -o jsonpath='{.items[*].metadata.name}')
+	for pod in $pods; do
+		kubectl delete pod -n "${NAMESPACE}" "${pod}"
+		wait_pod "${pod}"
+	done
+}
+
+get_updated_replicas() {
+	kubectl get statefulset "$1" -n "$NAMESPACE" -o jsonpath='{.status.updatedReplicas}'
+}
+
+# Function to get the desired number of replicas
+get_desired_replicas() {
+	kubectl get statefulset "$1" -n "$NAMESPACE" -o jsonpath='{.spec.replicas}'
+}
+
+wait_sts_rollout() {
+	local sts=$1
+	local updated_replicas=$(get_updated_replicas $sts)
+	local desired_replicas=$(get_desired_replicas $sts)
+
+	until [[ $updated_replicas -eq $desired_replicas ]]; do
+		updated_replicas=$(get_updated_replicas $sts)
+		desired_replicas=$(get_desired_replicas $sts)
+
+		echo "Waiting for sts/$sts to update... $updated_replicas/$desired_replicas pods updated."
+		sleep 10
+	done
+}
+
+wait_cluster_consistency() {
+	local cluster_name=$1
+	local wait_time=${2:-32}
+
+	retry=0
+	sleep 7 # wait for two reconcile loops ;)  3 sec x 2 times + 1 sec = 7 seconds
+	echo -n 'waiting for cluster readyness'
+	until [[ "$(kubectl -n "${NAMESPACE}" get pg "${cluster_name}" -o jsonpath='{.status.state}')" == "ready" ]]; do
+		let retry+=1
+		if [ $retry -ge $wait_time ]; then
+			echo max retry count $retry reached. something went wrong with operator or kubernetes cluster
+			exit 1
+		fi
+		echo -n .
+		sleep 10
+	done
+
+	sts=$(kubectl -n "${NAMESPACE}" get sts --selector=postgres-operator.crunchydata.com/cluster="${cluster_name}" -o jsonpath='{.items[*].metadata.name}' | grep "${cluster_name}")
+	for st in $sts; do
+		wait_sts_rollout "$st"
+	done
+}

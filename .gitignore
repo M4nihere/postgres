@@ -1,0 +1,26 @@
+/.vscode
+
+.DS_Store
+/vendor/
+tools
+/e2e-tests/conf/cloud-secret.yml
+/e2e-tests/conf/cloud-secret-minio-gw.yml
+/e2e-tests/conf/gcs-credentials.json
+licenses/*
+!licenses/LICENSE.txt
+bin/
+/testing/kuttl/e2e-generated/
+/testing/kuttl/e2e-generated-other/
+/testing/kuttl/e2e-generated*/
+
+# Test binary, build with 'go test -c'
+*.test
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+kubeconfig
+gke_gcloud_auth_plugin_cache
+
+### VisualStudioCode ###
+.vscode/*
+.history

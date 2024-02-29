@@ -1,0 +1,21 @@
+apiVersion: kuttl.dev/v1beta1
+kind: TestAssert
+timeout: 30
+---
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: 03-read-from-primary
+data:
+  data: ' 100500'
+---
+apiVersion: pgv2.percona.com/v2
+kind: PerconaPGBackup
+metadata:
+  generation: 1
+spec:
+  pgCluster: scheduled-backup
+  repoName: repo1
+status:
+  backupType: incremental
+  state: Succeeded
